@@ -223,6 +223,8 @@ util_unmap(void *addr, size_t len)
  * the range at *csump.  Otherwise the calculated checksum is
  * checked against *csump and the result returned (true means
  * the range checksummed correctly).
+ *
+ * addr, and csump are always assumed to be present in LE format.
  */
 int
 util_checksum(void *addr, size_t len, uint64_t *csump, int insert)
@@ -242,18 +244,19 @@ util_checksum(void *addr, size_t len, uint64_t *csump, int insert)
 			p32++;
 			hi32 += lo32;
 		} else {
-			lo32 += *p32++;
+			lo32 += le32toh(*p32);
+			++p32;
 			hi32 += lo32;
 		}
 
 	csum = (uint64_t)hi32 << 32 | lo32;
 
 	if (insert) {
-		*csump = csum;
+		*csump = htole64(csum);
 		return 1;
 	}
 
-	return *csump == csum;
+	return *csump == htole64(csum);
 }
 
 /*

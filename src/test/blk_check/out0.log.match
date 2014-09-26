@@ -1,0 +1,3 @@
+blk_check/TEST0: START: blk_check
+ ./blk_check$(*) $(*)/testfile1
+blk_check/TEST0: Done

@@ -178,7 +178,6 @@ pmemlog_map_common(int fd, int rdonly)
 		uuid_generate(hdrp->uuid);
 		hdrp->crtime = htole64((uint64_t)time(NULL));
 		util_checksum(hdrp, sizeof (*hdrp), &hdrp->checksum, 1);
-		hdrp->checksum = htole64(hdrp->checksum);
 
 		/* store pool's header */
 		libpmem_persist(is_pmem, hdrp, sizeof (*hdrp));

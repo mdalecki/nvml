@@ -299,6 +299,12 @@ read_info(struct btt_info *infop)
 		return 0;
 	}
 
+	/* to be valid, the fields must checksum correctly */
+	if (!util_checksum(infop, sizeof (*infop), &infop->checksum, 0)) {
+		LOG(3, "invalid checksum");
+		return 0;
+	}
+
 	/* to be valid, info block must have a major version of at least 1 */
 	if ((infop->major = le16toh(infop->major)) == 0) {
 		LOG(3, "invalid major version (0)");
@@ -318,13 +324,6 @@ read_info(struct btt_info *infop)
 	infop->mapoff = le64toh(infop->mapoff);
 	infop->flogoff = le64toh(infop->flogoff);
 	infop->infooff = le64toh(infop->infooff);
-	infop->checksum = le64toh(infop->checksum);
-
-	/* and to be valid, the fields must checksum correctly */
-	if (!util_checksum(infop, sizeof (*infop), &infop->checksum, 0)) {
-		LOG(3, "invalid checksum");
-		return 0;
-	}
 
 	return 1;
 }
@@ -333,8 +332,6 @@ read_info(struct btt_info *infop)
  * read_flog_pair -- (internal) load up a single flog pair
  *
  * Zero is returned on success, otherwise -1/errno.
- *
- * XXX lots of byzantine checks could be added, like range checking lbas
  */
 static int
 read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
@@ -346,6 +343,11 @@ read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
 	flog_runtimep->entries[0] = flog_off;
 	flog_runtimep->entries[1] = flog_off + sizeof (struct btt_flog);
 
+	if (lane < 0 || !(lane < bttp->nfree)) {
+		LOG(1, "invalid lane %d among nfree %d", lane, bttp->nfree);
+		return -1;
+	}
+
 	struct btt_flog flog_pair[2];
 	if ((*bttp->ns_cbp->nsread)(bttp->ns, lane, flog_pair,
 				sizeof (flog_pair), flog_off) < 0)
@@ -356,10 +358,16 @@ read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
 	flog_pair[0].new_map = le32toh(flog_pair[0].new_map);
 	flog_pair[0].seq = le32toh(flog_pair[0].seq);
 
+	if (invalid_lba(bttp, flog_pair[0].lba))
+		return -1;
+
 	flog_pair[1].lba = le32toh(flog_pair[1].lba);
 	flog_pair[1].old_map = le32toh(flog_pair[1].old_map);
 	flog_pair[1].new_map = le32toh(flog_pair[1].new_map);
 	flog_pair[1].seq = le32toh(flog_pair[1].seq);
+
+	if (invalid_lba(bttp, flog_pair[1].lba))
+		return -1;
 
 	LOG(6, "flog_pair[0] flog_off %zu old_map %u new_map %u seq %u",
 			flog_off, flog_pair[0].old_map,
@@ -491,16 +499,15 @@ flog_update(struct btt *bttp, int lane, struct arena *arenap,
 	off_t new_flog_off =
 		arenap->flogs[lane].entries[arenap->flogs[lane].next];
 
-	/* write out first three fields first */
-	/* XXX writing two fields and two fields will be faster */
+	/* write out first two fields first */
 	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog,
-				sizeof (uint32_t) * 3, new_flog_off) < 0)
+				sizeof (uint32_t) * 2, new_flog_off) < 0)
 		return -1;
-	new_flog_off += sizeof (uint32_t) * 3;
+	new_flog_off += sizeof (uint32_t) * 2;
 
-	/* write out seq field to make it active */
-	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog.seq,
-				sizeof (uint32_t), new_flog_off) < 0)
+	/* write out new_map and seq field to make it active */
+	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog.new_map,
+				sizeof (uint32_t) * 2, new_flog_off) < 0)
 		return -1;
 
 	/* flog entry written successfully, update run-time state */
@@ -986,6 +993,11 @@ read_layout(struct btt *bttp, int lane)
 			 */
 			return write_layout(bttp, lane, 0);
 		}
+		if (info.external_lbasize != bttp->lbasize) {
+			/* can't read it assuming the wrong block size */
+			LOG(3, "inconsistent lbasize");
+			return -1;
+		}
 
 		if (info.nfree < smallest_nfree)
 			smallest_nfree = info.nfree;
@@ -994,6 +1006,10 @@ read_layout(struct btt *bttp, int lane)
 		arena_off += info.nextoff;
 		if (info.nextoff == 0)
 			break;
+		if (info.nextoff > rawsize) {
+			LOG(3, "invalid area size info");
+			return -1;
+		}
 		rawsize -= info.nextoff;
 	}
 
@@ -1003,7 +1019,8 @@ read_layout(struct btt *bttp, int lane)
 	bttp->nlba = total_nlba;
 
 	/*
-	 * All arenas were valid.  nfree should be the smallest value found.
+	 * All arenas were valid.  nfree should be the smallest value found
+	 * between different arenas.
 	 */
 	if (smallest_nfree < bttp->nfree)
 		bttp->nfree = smallest_nfree;
@@ -1068,10 +1085,11 @@ lba_to_arena_lba(struct btt *bttp, uint64_t lba,
  *
  * Returns handle on success, otherwise NULL/errno.
  *
- * XXX handle case where lbasize doesn't match lbasize found in valid arenas.
- * XXX check rawsize against size from valid arenas.
- * XXX what if write_layout produces something read_layout says is invalid?
- * XXX what if arenas have different nfree?
+ * When submitted a pristine namespace it will be formatted implicitly when
+ * touched for the first time.
+ *
+ * If arenas have different nfree values, we will be using the lowest one
+ * found as limiting to the overall "bandwidth".
  */
 struct btt *
 btt_init(uint64_t rawsize, uint32_t lbasize, uint8_t parent_uuid[],
@@ -1414,7 +1432,12 @@ btt_write(struct btt *bttp, int lane, uint64_t lba, const void *buf)
 
 	if (map_unlock(bttp, lane, arenap, htole32(free_entry),
 					premap_lba) < 0) {
-		/* XXX retry? revert the flog? */
+		/*
+		 * Recover from the incomplete transaction in exactly
+		 * the same way as during the startup.
+		 */
+		read_flog_pair(bttp, lane, arenap,
+			arenap->flogoff, &arenap->flogs[lane], 0);
 		return -1;
 	}
 
@@ -1650,7 +1673,125 @@ btt_check(struct btt *bttp)
 		return consistent;
 	}
 
-	/* XXX report issues found during read_layout (from flags) */
+	/*
+	 * Perform the same checks as during read_layout.
+	 */
+	if (bttp->rawsize < BTT_MIN_SIZE) {
+		LOG(3, "bttp %p: rawsize below minimum", bttp);
+		return 0;
+	}
+
+	if (bttp->nfree == 0) {
+		LOG(3, "bttp %p: no free blocks", bttp);
+		return 0;
+	}
+
+	uint32_t smallest_nfree = UINT32_MAX;
+	uint64_t total_nlba = 0;
+	off_t arena_off = 0;
+
+	/*
+	 * For each arena, see if there's a valid info block
+	 */
+	int narena = 0;
+	uint64_t rawsize = bttp->rawsize;
+	while (rawsize >= BTT_MIN_SIZE) {
+		narena++;
+
+		struct btt_info info;
+		if ((*bttp->ns_cbp->nsread)(bttp->ns, 0, &info,
+					sizeof (info), arena_off) < 0) {
+			LOG(3, "nsread failed");
+			return -1;
+		}
+
+		if (memcmp(info.sig, Sig, BTTINFO_SIG_LEN)) {
+			LOG(3, "signature invalid");
+			return 0;
+		}
+
+		if (le16toh(info.major) == 0) {
+			LOG(3, "invalid major version (0)");
+			return 0;
+		}
+
+		/* verify the checksum */
+		if (!util_checksum(&info, sizeof (info), &info.checksum, 0)) {
+			LOG(3, "invalid checksum");
+			return 0;
+		}
+
+		/* endianness conversions */
+		info.major = le16toh(info.major);
+		info.flags = le32toh(info.flags);
+		info.minor = le16toh(info.minor);
+		info.external_lbasize = le32toh(info.external_lbasize);
+		if (info.external_lbasize == 0) {
+			LOG(3, "invalid external blocksize");
+			return 0;
+		}
+		if (info.external_lbasize != bttp->lbasize) {
+			LOG(3, "inconsistent lbasize");
+			return 0;
+		}
+
+		info.external_nlba = le32toh(info.external_nlba);
+		info.internal_lbasize = le32toh(info.internal_lbasize);
+		if (info.internal_lbasize == 0) {
+			LOG(3, "invalid internal blocksize");
+			return 0;
+		}
+
+		info.internal_nlba = le32toh(info.internal_nlba);
+		if (info.infosize == 0) {
+			LOG(3, "invalid size of info");
+			return 0;
+		}
+
+		info.nfree = le32toh(info.nfree);
+		info.infosize = le32toh(info.infosize);
+		if (info.infosize == 0) {
+			LOG(3, "invalid size of info");
+			return 0;
+		}
+
+		info.nextoff = le64toh(info.nextoff);
+		info.dataoff = le64toh(info.dataoff);
+		info.mapoff = le64toh(info.mapoff);
+		info.flogoff = le64toh(info.flogoff);
+		info.infooff = le64toh(info.infooff);
+
+		if (info.nfree < smallest_nfree)
+			smallest_nfree = info.nfree;
+
+		total_nlba += info.external_nlba;
+		arena_off += info.nextoff;
+		if (info.nextoff == 0)
+			break;
+		if (info.nextoff > rawsize) {
+			LOG(3, "invalid area size info");
+			return 0;
+		}
+		rawsize -= info.nextoff;
+	}
+
+	if (narena == 0) {
+		LOG(3, "bttp %p: no arenas found", bttp);
+		return 0;
+	}
+	if (total_nlba == 0) {
+		LOG(3, "bttp %p: no space", bttp);
+		return 0;
+	}
+
+	/*
+	 * nfree should be the smallest value found.
+	 */
+
+	if (smallest_nfree != bttp->nfree) {
+		LOG(3, "bttp %p: invalid nfree", bttp);
+		return 0;
+	}
 
 	/* for each arena... */
 	struct arena *arenap = bttp->arenas;
@@ -1665,7 +1806,6 @@ btt_check(struct btt *bttp)
 			consistent = 0;
 	}
 
-	/* XXX stub */
 	return consistent;
 }
 

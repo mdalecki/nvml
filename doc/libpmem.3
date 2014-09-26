@@ -309,7 +309,7 @@ These functions allow advanced programs to create their
 own variations of
 .BR pmem_persist ().
 For example, a program
-that needs to flush several discontiguous ranges can call
+that needs to flush several discontinuous ranges can call
 .BR pmem_flush ()
 for each range and then follow up by
 calling the
@@ -924,12 +924,13 @@ described in this manual.
 .BI "int pmemlog_check(const char *" path );
 .fi
 .IP
-These functions perform a consistency check of the file
+These functions perform a extensive consistency check of the file
 indicated by
 .IR path .
-They return true if the memory pool is found to be consistent.  In
-the event of inconsistencies, continued use of the file
-with
+They return 1 if the memory pool during the check is found to be consistent
+and 0 otherwise. Cases where the check couldn't be performed,
+are indicated by a return value of -1. In the event of inconsistencies,
+continued use of the file with
 .B libpmem
 will result in undefined behavior.  The debug version of
 .B libpmem

@@ -31,20 +31,16 @@
  */
 
 /*
- * blk_rw_mt.c -- unit test for multi-threaded random I/O
+ * blk_check.c -- unit test for pmemblk_check
  *
- * usage: blk_rw_mt bsize file seed nthread nops
+ * usage: blk_check bsize file seed nthread nops
  *
  */
 
 #include "unittest.h"
 
-size_t Bsize;
-size_t Nblock = 100;	/* all I/O below this LBA (increases collisions) */
-unsigned Seed;
-unsigned Nthread;
-unsigned Nops;
-PMEMblk *Handle;
+static const size_t Bsize = 128;
+static PMEMblk *Handle;
 
 /*
  * construct -- build a buffer for writing
@@ -61,95 +57,78 @@ construct(int *ordp, unsigned char *buf)
 		*ordp = 1;
 }
 
-/*
- * check -- check for torn buffers
- */
-void
-check(unsigned char *buf)
-{
-	unsigned val = *buf;
-
-	for (int i = 1; i < Bsize; i++)
-		if (buf[i] != val) {
-			OUT("{%u} TORN at byte %d", val, i);
-			break;
-		}
-}
-
-/*
- * worker -- the work each thread performs
- */
-void *
-worker(void *arg)
-{
-	long mytid = (long)arg;
-	unsigned myseed = Seed + mytid;
-	unsigned char buf[Bsize];
-	int ord = 1;
-
-	for (int i = 0; i < Nops; i++) {
-		off_t lba = rand_r(&myseed) % Nblock;
-
-		if (rand_r(&myseed) % 2) {
-			/* read */
-			if (pmemblk_read(Handle, buf, lba) < 0)
-				OUT("!read      lba %zu", lba);
-			else
-				check(buf);
-		} else {
-			/* write */
-			construct(&ord, buf);
-			if (pmemblk_write(Handle, buf, lba) < 0)
-				OUT("!write     lba %zu", lba);
-		}
-	}
-
-	return NULL;
-}
 
 int
 main(int argc, char *argv[])
 {
-	START(argc, argv, "blk_rw_mt");
+	START(argc, argv, "blk_check");
 
-	if (argc != 6)
-		FATAL("usage: %s bsize file seed nthread nops", argv[0]);
+	if (argc < 2)
+		FATAL("usage: %s file check1 check2 ...", argv[0]);
 
-	Bsize = strtoul(argv[1], NULL, 0);
+	char *file_name = argv[1];
 
-	int fd = OPEN(argv[2], O_RDWR);
+	/*
+	 * This will basically format the file.
+	 */
+	int fd = OPEN(file_name, O_RDWR);
 
-	if ((Handle = pmemblk_map(fd, Bsize)) == NULL)
-		FATAL("!%s: pmemblk_map", argv[2]);
+	if ((Handle = pmemblk_map(fd, 4096)) == NULL)
+		FATAL("!%s: pmemblk_map", file_name);
 
 	close(fd);
 
-	if (Nblock == 0)
-		Nblock = pmemblk_nblock(Handle);
-	Seed = strtoul(argv[3], NULL, 0);
-	Nthread = strtoul(argv[4], NULL, 0);
-	Nops = strtoul(argv[5], NULL, 0);
+	pmemblk_unmap(Handle);
 
-	OUT("%s block size %zu usable blocks %zu", argv[1], Bsize, Nblock);
 
-	pthread_t threads[Nthread];
+	/*
+	 * Perform different tests according to id number specified
+	 * on the command line.
+	 *
+	 * First we prepare a filure case.
+	 */
+	fd = OPEN(file_name, O_RDWR);
+	if ((Handle = pmemblk_map(fd, 4096)) == NULL)
+		FATAL("!%s: pmemblk_map", file_name);
 
-	/* kick off nthread threads */
-	for (int i = 0; i < Nthread; i++)
-		PTHREAD_CREATE(&threads[i], NULL, worker, (void *)(long)i);
+	for (int count = 2; count < argc; ++count) {
+		int test = strtoul(argv[count], NULL, 0);
 
-	/* wait for all the threads to complete */
-	for (int i = 0; i < Nthread; i++)
-		PTHREAD_JOIN(threads[i], NULL);
+		switch (test) {
+		case 0:
+			/* test for bad address */
+			argv[1] = argv[2];
+			break;
+
+		case 1:
+			break;
+
+		case 2:
+			break;
+
+		default:
+			/* unknown test case */
+			break;
+		}
+	}
+
+
+
+
+	close(fd);
 
 	pmemblk_unmap(Handle);
 
-	/* verify the consistency of the data */
-	int result = pmemblk_check(argv[2]);
+
+	/*
+	 * Now we verify the consistency of the data, which is inconsistent
+	 * according to the test case choosen.
+	 */
+	int result = pmemblk_check(file_name);
 	if (result < 0)
-		OUT("!%s: pmemblk_check", argv[2]);
+		OUT("!%s: pmemblk_check", file_name);
 	else if (result == 0)
-		OUT("%s: pmemblk_check: not consistent", argv[2]);
+		OUT("%s: pmemblk_check: not consistent", file_name);
 
 	DONE(NULL);
 }
